@@ -297,11 +297,13 @@ def make_tf_dataset(
     batch_size: int = config.DEFAULT_BATCH_SIZE,
     shuffle: bool = False,
     h5_path: str | None = None,
+    repeat: bool = False,
 ):
     """
     TensorFlow 학습용 Dataset을 만듭니다.
 
     load_split()과 동일한 전처리를 사용하지만, h5를 batch 단위로 읽어서 메모리를 아낍니다.
+    repeat=True는 Keras fit에서 여러 epoch를 학습할 때 데이터가 고갈되지 않게 합니다.
     TensorFlow import 비용을 줄이기 위해 함수 내부에서 import합니다.
     """
     import tensorflow as tf
@@ -328,7 +330,10 @@ def make_tf_dataset(
         tf.TensorSpec(shape=(None, config.WINDOW_LEN, channel_count), dtype=tf.float32),
         tf.TensorSpec(shape=(None,), dtype=tf.int64),
     )
-    return tf.data.Dataset.from_generator(generator, output_signature=output_signature).prefetch(tf.data.AUTOTUNE)
+    dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+    if repeat:
+        dataset = dataset.repeat()
+    return dataset.prefetch(tf.data.AUTOTUNE)
 
 
 def count_split_samples(split: str, split_mode: str = "author", h5_path: str | None = None) -> int:

@@ -96,6 +96,7 @@ def train_model(args: argparse.Namespace) -> Path:
         batch_size=args.batch_size,
         shuffle=True,
         h5_path=args.h5_path,
+        repeat=True,
     )
     valid_ds = make_tf_dataset(
         split="valid",
@@ -105,6 +106,7 @@ def train_model(args: argparse.Namespace) -> Path:
         batch_size=args.batch_size,
         shuffle=False,
         h5_path=args.h5_path,
+        repeat=True,
     )
 
     train_steps = steps_for_split("train", args.batch_size, args.split_mode, args.h5_path)
