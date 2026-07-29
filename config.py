@@ -26,6 +26,7 @@ MODEL_DIR = Path("models")
 ARTIFACT_DIR = Path("artifacts")
 RESULT_DIR = Path("results")
 STAT_CACHE_DIR = ARTIFACT_DIR / "stats"
+CHECKPOINT_DIR = MODEL_DIR / "checkpoints"   # epoch별/latest 체크포인트 저장 위치
 
 # 대용량 h5를 한 번에 메모리에 올리지 않기 위해 데이터를 읽는 단위입니다.
 # Kaggle GPU 메모리가 부족하면 1024~2048로 줄이고, 여유가 있으면 키워도 됩니다.

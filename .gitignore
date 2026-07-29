@@ -4,6 +4,7 @@ __pycache__/
 artifacts/stats/*.npz
 models/*.keras
 models/*.h5
+models/checkpoints/
 results/*.csv
 results/*.json
 *.zip

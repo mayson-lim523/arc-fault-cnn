@@ -366,3 +366,112 @@ def count_labels(split: str = "train", split_mode: str = "author", h5_path: str 
 def steps_for_split(split: str, batch_size: int, split_mode: str = "author", h5_path: str | None = None) -> int:
     """Keras fit/evaluate에 넘길 step 수를 계산합니다."""
     return int(math.ceil(count_split_samples(split, split_mode, h5_path) / batch_size))
+
+
+# ===========================================================================
+# RAM preload backend (병합본: 동료의 병렬 tf.data.map + ram-limit +
+#                       제 안전장치인 '기존 _rows_to_xy와 동일성 보장' 검증 함수)
+#   - split 전체를 int16로 RAM에 한 번만 올림 → epoch마다 디스크 재읽기 없음
+#   - 배치 디코드(float32 변환/transpose/정규화)는 tf.data.map으로 병렬 처리
+#   - v1은 split_mode="author"만 지원 (random/block은 기존 h5 backend 사용)
+# ===========================================================================
+def preload_split_int16(
+    split: str,
+    h5_path: str | None = None,
+    limit: int | None = None,
+    chunk_size: int = 50_000,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """h5 split을 int16 원본(신호 (N,9600), 라벨 (N,))으로 RAM에 한 번만 올립니다."""
+    resolved_path = _resolve_h5_path(h5_path)
+    sig_width = config.N_CHANNELS * config.WINDOW_LEN
+    with h5py.File(resolved_path, "r") as h5_file:
+        dataset = h5_file[split]
+        n = dataset.shape[0] if limit is None else min(limit, dataset.shape[0])
+        sig = np.empty((n, sig_width), dtype=np.int16)
+        y = np.empty((n,), dtype=np.int64)
+        for start in range(0, n, chunk_size):
+            end = min(start + chunk_size, n)
+            block = np.asarray(dataset[start:end])
+            sig[start:end] = block[:, :sig_width]
+            y[start:end] = block[:, -1].astype(np.int64)
+    return sig, y
+
+
+def compute_ram_channel_stats(
+    sig: np.ndarray, channels: str = "all", chunk_size: int = 50_000
+) -> Tuple[np.ndarray, np.ndarray]:
+    """RAM int16 train 신호에서 채널별 mean/std를 float64 누적으로 정확히 계산합니다."""
+    channel_idx = CHANNEL_INDEX[channels]
+    total_sum = np.zeros(len(channel_idx), dtype=np.float64)
+    total_sq = np.zeros(len(channel_idx), dtype=np.float64)
+    total_count = 0
+    for start in range(0, len(sig), chunk_size):
+        end = min(start + chunk_size, len(sig))
+        raw = sig[start:end].reshape(-1, config.N_CHANNELS, config.WINDOW_LEN)
+        raw = raw[:, channel_idx, :].astype(np.float64)
+        total_sum += raw.sum(axis=(0, 2))
+        total_sq += np.square(raw).sum(axis=(0, 2))
+        total_count += raw.shape[0] * config.WINDOW_LEN
+    mean = total_sum / total_count
+    var = np.maximum(total_sq / total_count - np.square(mean), 1e-12)
+    return mean.astype(np.float32), np.sqrt(var).astype(np.float32)
+
+
+def make_ram_tf_dataset(
+    sig: np.ndarray,
+    y: np.ndarray,
+    channels: str = "all",
+    normalize: str = "global",
+    batch_size: int = config.DEFAULT_BATCH_SIZE,
+    shuffle: bool = False,
+    repeat: bool = True,
+    global_mean: np.ndarray | None = None,
+    global_std: np.ndarray | None = None,
+):
+    """RAM int16 배열에서 TF Dataset을 만듭니다. 디코드는 tf.data.map으로 병렬 처리."""
+    import tensorflow as tf
+
+    _validate_options("train", channels, normalize, "author")
+    channel_idx = CHANNEL_INDEX[channels]
+    channel_count = len(channel_idx)
+
+    if normalize == "global":
+        if global_mean is None or global_std is None:
+            raise ValueError("RAM global normalization requires global_mean/global_std")
+        mean_t = tf.constant(global_mean.reshape(1, 1, channel_count), dtype=tf.float32)
+        std_t = tf.constant(global_std.reshape(1, 1, channel_count), dtype=tf.float32)
+
+    indices = np.arange(len(y))
+
+    def generator():
+        rng = np.random.default_rng(config.SEED)
+        while True:
+            order = indices.copy()
+            if shuffle:
+                rng.shuffle(order)
+            for start in range(0, len(order), batch_size):
+                b = order[start:start + batch_size]
+                yield sig[b], y[b]
+            if not repeat:
+                break
+
+    output_signature = (
+        tf.TensorSpec(shape=(None, config.N_CHANNELS * config.WINDOW_LEN), dtype=tf.int16),
+        tf.TensorSpec(shape=(None,), dtype=tf.int64),
+    )
+    dataset = tf.data.Dataset.from_generator(generator, output_signature=output_signature)
+
+    def decode_and_normalize(sig_batch, y_batch):
+        x = tf.reshape(sig_batch, (-1, config.N_CHANNELS, config.WINDOW_LEN))
+        x = tf.gather(x, channel_idx.tolist(), axis=1)
+        x = tf.transpose(x, (0, 2, 1))          # (B, 3200, C)
+        x = tf.cast(x, tf.float32)
+        if normalize == "global":
+            x = (x - mean_t) / std_t
+        else:
+            m = tf.reduce_mean(x, axis=1, keepdims=True)
+            s = tf.math.reduce_std(x, axis=1, keepdims=True)
+            x = (x - m) / tf.maximum(s, 1e-6)
+        return x, y_batch
+
+    return dataset.map(decode_and_normalize, num_parallel_calls=tf.data.AUTOTUNE).prefetch(tf.data.AUTOTUNE)
